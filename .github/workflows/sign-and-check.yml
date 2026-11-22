@@ -1,0 +1,73 @@
+name: Auto-Check OCSP & Sign Malay City
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: 'URL IPA mentah'
+        required: true
+        default: 'https://github.com/iOSVNNews/mugoat/releases/download/v2.0/Mugoat.ipa'
+      release_tag:
+        description: 'Tag Release'
+        required: true
+        default: 'v2.0'
+      force_sign:
+        description: 'Teruskan sign walaupun revoked (untuk pengguna DNS)'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '0 */12 * * *'
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dekod Sijil
+        env:
+          P12: ${{ secrets.CERT_P12_BASE64 }}
+          PROV: ${{ secrets.MOBILEPROVISION_BASE64 }}
+        run: |
+          echo "$P12" | base64 -d > cert.p12
+          echo "$PROV" | base64 -d > profile.mobileprovision
+
+      - name: Semak OCSP
+        env:
+          PASS: ${{ secrets.CERT_PASSWORD }}
+        run: |
+          openssl pkcs12 -in cert.p12 -clcerts -nokeys -out cert.pem -passin env:PASS 2>/dev/null || \
+          openssl pkcs12 -in cert.p12 -clcerts -nokeys -out cert.pem -passin env:PASS -legacy
+          ISSUER_URL=$(openssl x509 -in cert.pem -noout -text | grep "CA Issuers - URI:" | head -n1 | sed 's/.*URI://')
+          curl -sL "$ISSUER_URL" -o issuer.cer
+          openssl x509 -inform DER -in issuer.cer -out issuer.pem
+          OCSP_URL=$(openssl x509 -noout -ocsp_uri -in cert.pem)
+          OCSP_HOST=$(echo "$OCSP_URL" | awk -F/ '{print $3}')
+          RES=$(openssl ocsp -issuer issuer.pem -cert cert.pem -url "$OCSP_URL" -header "Host" "$OCSP_HOST" 2>&1 || true)
+          echo "$RES"
+          if ! echo "$RES" | grep -q "cert.pem: good" && [ "${{ inputs.force_sign }}" != "true" ]; then
+            echo "🔴 Sijil bukan status GOOD!"; exit 1
+          fi
+
+      - name: Sign Malay City (zsign)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          PASS: ${{ secrets.CERT_PASSWORD }}
+          IPA_URL: ${{ inputs.ipa_url }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y g++ libssl-dev zip unzip
+          git clone --depth 1 https://github.com/zhlynn/zsign.git
+          g++ zsign/src/*.cpp zsign/src/common/*.cpp -lcrypto -O3 -std=c++11 -o zsign_bin
+          curl -L "$IPA_URL" -o input.ipa
+          ./zsign_bin -k cert.p12 -p "$PASS" -m profile.mobileprovision -b "com.malaycity.ios" -n "Malay City" -o MalayCity-signed.ipa -z 9 input.ipa
+
+      - name: Muat Naik ke Releases
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Malay City $TAG" --notes "Keluaran rasmi Malay City."
+          gh release upload "$TAG" MalayCity-signed.ipa --clobber
